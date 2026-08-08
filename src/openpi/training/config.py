@@ -256,6 +256,7 @@ class LeRobotX2robotDataConfig(DataConfigFactory):
     only_right_obs: bool = False
     mask_left_obs: bool = False
     filter_issue_samples: bool = False
+    project_from_sm2sm: bool = False
    
     @property
     def state_sequence_length(self) -> int:
@@ -296,7 +297,9 @@ class LeRobotX2robotDataConfig(DataConfigFactory):
         *,
         enable_augmentation: bool,
     ) -> DataConfig:
-        assert self.mode in ["s2s", "s2m", "sm2m", "sm2sm", "smp2smp"], f"Invalid mode: {self.mode}"
+        assert self.mode in ["s2s", "s2m", "m2m", "sm2m", "sm2sm", "smp2smp"], (
+            f"Invalid mode: {self.mode}"
+        )
 
         random_drop_master = self.random_drop_master if enable_augmentation else 0.0
         random_drop_history = self.random_drop_history if enable_augmentation else 0.0
@@ -321,8 +324,13 @@ class LeRobotX2robotDataConfig(DataConfigFactory):
                 random_pos_offset=random_pos_offset,
                 only_right_obs=self.only_right_obs,
                 mask_left_obs=self.mask_left_obs,
+                project_from_sm2sm=self.project_from_sm2sm,
             )],
-            outputs=[arx_policy.ArxOutputs(action_dim=self.action_dim)],
+            outputs=[arx_policy.ArxOutputs(
+                action_dim=self.action_dim,
+                mode=self.mode,
+                project_from_sm2sm=self.project_from_sm2sm,
+            )],
         )
         if self.use_delta_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
@@ -332,6 +340,27 @@ class LeRobotX2robotDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory()(model_config)
+        if self.project_from_sm2sm:
+            model_transforms = _transforms.Group(
+                inputs=[
+                    arx_policy.ProjectNormalizedSm2sm(
+                        mode=self.mode,
+                        action_dim=model_config.action_dim,
+                        state_history_size=self.state_history_size,
+                        state_future_size=self.state_future_size,
+                        slave_state_dim=self.slave_state_dim,
+                    ),
+                    *model_transforms.inputs,
+                ],
+                outputs=[
+                    *model_transforms.outputs,
+                    arx_policy.RestoreNormalizedSm2smActions(
+                        mode=self.mode,
+                        action_dim=model_config.action_dim,
+                        slave_state_dim=self.slave_state_dim,
+                    ),
+                ],
+            )
 
         # Create base config and fix zero-variance dimensions if needed
         base_config = self.create_base_config(assets_dirs, model_config)
@@ -1605,6 +1634,51 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
         
         exp_name="pipeline_0120+0121+0422+0423_sm2sm_h9f4mlo_a30_dm10dh50df80po20",
+    ),
+    TrainConfig(
+        name="pipeline_pi0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotX2robotDataConfig(
+            repo_id="pipeline_0120_0121_0808_sm2sm",
+            mode="sm2sm",
+            state_history_size=9,
+            state_future_size=3,
+            only_right_obs=True,
+            action_dim=28,
+            project_from_sm2sm=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/public3/xcj/openpi/checkpoints/pipeline_sm2sm/"
+            "pipeline_0120+0121+0422+0423_sm2sm_h9f4mlo_a30_dm10dh50df80po20/params"
+        ),
+        batch_size=16,
+        num_train_steps=30_000,
+        exp_name="pipeline_0120+0121+0808_sm2sm_h9f3oro_a30_bs16_steps30k",
+    ),
+    TrainConfig(
+        name="pipeline_pi05",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            pi05_state_sequence_in_suffix=True,
+        ),
+        data=LeRobotX2robotDataConfig(
+            repo_id="pipeline_0120_0121_0808_sm2sm",
+            assets=AssetsConfig(assets_dir="assets/pipeline_pi0"),
+            mode="sm2sm",
+            state_history_size=9,
+            state_future_size=3,
+            only_right_obs=True,
+            action_dim=28,
+            project_from_sm2sm=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(?:lora|state_sequence_proj).*",
+        ),
+        batch_size=16,
+        num_train_steps=30_000,
+        exp_name="pipeline_0120+0121+0808_pi05_sm2sm_h9f3oro_a30_bs16_steps30k",
     ),
     TrainConfig(
         name="wipe_sm2sm",

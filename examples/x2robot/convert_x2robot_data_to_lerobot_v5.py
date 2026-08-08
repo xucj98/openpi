@@ -31,6 +31,7 @@ import tyro
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from fractions import Fraction
 
     
 # Suppress ffmpeg output
@@ -120,11 +121,67 @@ def find_episodes(raw_paths: list[str]) -> list[str]:
     return sorted(episode_paths)
 
 
+def find_tagged_quality_episodes(
+    dataset_root: Path,
+    required_tag: str,
+    tags_relative_path: Path,
+    quality_annotation_relative_path: Path,
+    quality_key: str,
+) -> tuple[list[str], dict[str, tuple[int, int]]]:
+    """Select tagged episodes which have a valid quality-passed frame range."""
+    episode_paths = []
+    passed_ranges = {}
+    tagged_count = 0
+    missing_quality_count = 0
+
+    for episode_path in sorted(path for path in dataset_root.iterdir() if path.is_dir()):
+        tags_path = episode_path / tags_relative_path
+        if not tags_path.is_file():
+            continue
+
+        tags_payload = json.loads(tags_path.read_text())
+        tags = tags_payload.get("tags", [])
+        if not isinstance(tags, list):
+            raise ValueError(f"Expected a list at {tags_path}:tags")
+        if required_tag not in tags:
+            continue
+        tagged_count += 1
+
+        quality_path = episode_path / quality_annotation_relative_path
+        if not quality_path.is_file():
+            missing_quality_count += 1
+            continue
+
+        quality_payload = json.loads(quality_path.read_text())
+        frame_range = quality_payload.get(quality_key)
+        if (
+            not isinstance(frame_range, list)
+            or len(frame_range) != 2
+            or not all(isinstance(value, int) for value in frame_range)
+        ):
+            raise ValueError(
+                f"Expected key {quality_key!r} to contain [start_frame, end_frame] at {quality_path}"
+            )
+        start_frame, end_frame = frame_range
+        if start_frame < 0 or end_frame <= start_frame:
+            raise ValueError(f"Invalid half-open frame range {frame_range} at {quality_path}")
+
+        episode_path_str = str(episode_path)
+        episode_paths.append(episode_path_str)
+        passed_ranges[episode_path_str] = (start_frame, end_frame)
+
+    print(
+        f"Tag {required_tag!r}: {tagged_count} episodes; selected {len(episode_paths)} with "
+        f"{quality_annotation_relative_path}; skipped {missing_quality_count} without it"
+    )
+    return episode_paths, passed_ranges
+
+
 def load_json_data(
     episode_path: str,
     target_frame_count: int,
     target_fps: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float, int]:
     """Load and parse JSON data for an episode."""
     episode_name = os.path.basename(episode_path)
     json_path = os.path.join(episode_path, f"{episode_name}.json")
@@ -132,7 +189,27 @@ def load_json_data(
     with open(json_path, 'r') as f:
         payload = json.load(f)
     data = payload['data']
-    source_fps = float(payload.get("fps", 30.0))
+    source_fps = payload.get("fps")
+    if source_fps is None:
+        video_path = os.path.join(episode_path, FILE_CAMERA_MAPPING["face_view"])
+        probe_result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe_result.returncode != 0 or not probe_result.stdout.strip():
+            raise RuntimeError(f"Could not determine source fps for {video_path}: {probe_result.stderr}")
+        source_fps = float(Fraction(probe_result.stdout.strip()))
+    else:
+        source_fps = float(source_fps)
+    if source_fps <= 0:
+        raise ValueError(f"Invalid source fps {source_fps} at {json_path}")
     target_indices = np.arange(target_frame_count, dtype=np.float64)
     source_indices = np.rint(target_indices * source_fps / target_fps).astype(np.int64)
     source_indices = np.clip(source_indices, 0, len(data) - 1)
@@ -152,7 +229,104 @@ def load_json_data(
     
     state_array = np.concatenate([arrays[key][source_indices] for key in STATE_KEYS], axis=1)
     action_array = np.concatenate([arrays[key][source_indices] for key in ACTION_KEYS], axis=1)
-    return state_array, action_array
+    return state_array, action_array, source_fps, len(data)
+
+
+def _target_excluded_ranges(
+    passed_range: tuple[int, int],
+    source_frame_count: int,
+    source_fps: float,
+    target_fps: int,
+    target_frame_count: int,
+) -> tuple[list[list[int]], list[int] | None]:
+    """Map the complement of a raw passed interval to rows with next-frame actions."""
+    target_indices = np.arange(target_frame_count, dtype=np.float64)
+    source_indices = np.rint(target_indices * source_fps / target_fps).astype(np.int64)
+    source_indices = np.clip(source_indices, 0, source_frame_count - 1)
+
+    source_start, source_end = passed_range
+    passed_source_frames = np.zeros(source_frame_count, dtype=bool)
+    passed_source_frames[source_start:source_end] = True
+    passed_rows = passed_source_frames[source_indices[:-1]] & passed_source_frames[source_indices[1:]]
+    excluded_rows = ~passed_rows
+
+    changes = np.flatnonzero(excluded_rows[1:] != excluded_rows[:-1]) + 1
+    excluded_ranges = []
+    run_start = 0
+    for run_end in [*changes.tolist(), len(excluded_rows)]:
+        if excluded_rows[run_start]:
+            excluded_ranges.append([run_start, run_end])
+        run_start = run_end
+
+    passed_indices = np.flatnonzero(passed_rows)
+    target_passed_range = (
+        [int(passed_indices[0]), int(passed_indices[-1]) + 1]
+        if len(passed_indices)
+        else None
+    )
+    return excluded_ranges, target_passed_range
+
+
+def write_quality_filter_metadata(
+    output_path: Path,
+    quality_annotation_relative_path: Path,
+    quality_key: str,
+    target_fps: int,
+    episode_paths: list[str],
+    passed_ranges: dict[str, tuple[int, int]],
+    video_frame_counts: list[int],
+    source_fps_values: list[float],
+    source_frame_counts: list[int],
+) -> None:
+    metadata_dir = output_path / "meta" / "data_quality"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    episodes = []
+
+    for episode_index, (episode_path, video_frame_count, source_fps, source_frame_count) in enumerate(
+        zip(
+            episode_paths,
+            video_frame_counts,
+            source_fps_values,
+            source_frame_counts,
+            strict=True,
+        )
+    ):
+        source_start, source_end = passed_ranges[episode_path]
+        if source_end > source_frame_count:
+            raise ValueError(
+                f"Quality-passed end frame {source_end} exceeds source length {source_frame_count}: "
+                f"{episode_path}"
+            )
+
+        excluded_ranges, target_passed_range = _target_excluded_ranges(
+            (source_start, source_end),
+            source_frame_count,
+            source_fps,
+            target_fps,
+            video_frame_count,
+        )
+
+        episodes.append(
+            {
+                "episode_index": episode_index,
+                "source_episode": Path(episode_path).name,
+                "source_passed_range": [source_start, source_end],
+                "target_passed_range": target_passed_range,
+                "sample_ranges": excluded_ranges,
+            }
+        )
+
+    metadata = {
+        "format_version": 1,
+        "annotation_relative_path": str(quality_annotation_relative_path),
+        "quality_key": quality_key,
+        "target_fps": target_fps,
+        "range_semantics": "half_open",
+        "sample_ranges_semantics": "excluded_complement_of_quality_passed",
+        "episodes": episodes,
+    }
+    with (metadata_dir / "excluded_sample_ranges.json").open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
 
 def transcode_video_ffmpeg(
@@ -405,6 +579,7 @@ class NoVideoIOLeRobotDataset(LeRobotDataset):
 
 def main(
     dataset_root: Path | None = None,
+    dataset_roots: tuple[Path, ...] = (),
     repo_name: str = REPO_NAME,
     push_to_hub: bool = False,
     debug: bool = False,
@@ -414,6 +589,10 @@ def main(
     target_fps: int = 20,
     video_codec: str = "h264",
     overwrite: bool = False,
+    required_tag: str | None = None,
+    tags_relative_path: Path = Path("anno/tags.json"),
+    quality_annotation_relative_path: Path | None = None,
+    quality_key: str = "0",
 ):
     """
     V5: Direct ffmpeg transcoding optimization.
@@ -434,8 +613,32 @@ def main(
         print(f"Removing existing dataset at {output_path}")
         shutil.rmtree(output_path)
     
-    raw_dataset_paths = [str(dataset_root)] if dataset_root is not None else RAW_DATASET_PATHS
-    episode_paths = find_episodes(raw_dataset_paths)
+    if dataset_root is not None and dataset_roots:
+        raise ValueError("Pass either dataset_root or dataset_roots, not both")
+
+    quality_passed_ranges = None
+    if required_tag is not None:
+        if dataset_roots:
+            raise ValueError("required_tag selection currently accepts one dataset_root")
+        if dataset_root is None:
+            raise ValueError("dataset_root is required when required_tag is set")
+        if quality_annotation_relative_path is None:
+            raise ValueError("quality_annotation_relative_path is required when required_tag is set")
+        episode_paths, quality_passed_ranges = find_tagged_quality_episodes(
+            dataset_root,
+            required_tag,
+            tags_relative_path,
+            quality_annotation_relative_path,
+            quality_key,
+        )
+    else:
+        if quality_annotation_relative_path is not None:
+            raise ValueError("required_tag must be set when quality_annotation_relative_path is set")
+        if dataset_roots:
+            raw_dataset_paths = [str(path) for path in dataset_roots]
+        else:
+            raw_dataset_paths = [str(dataset_root)] if dataset_root is not None else RAW_DATASET_PATHS
+        episode_paths = find_episodes(raw_dataset_paths)
     print(f"Found {len(episode_paths)} episodes")
     if debug:
         episode_paths = episode_paths[:debug_episodes]
@@ -583,6 +786,8 @@ def main(
     t_build_start = time.time()
     
     dummy_image = np.zeros((shape[0], shape[1], shape[2]), dtype=np.uint8)
+    processed_source_fps = []
+    processed_source_frame_counts = []
     
     import datasets
     datasets.disable_progress_bars()
@@ -594,7 +799,11 @@ def main(
             desc="Building dataset",
         )
     ):
-        state_array, action_array = load_json_data(ep_path, video_frame_count, target_fps)
+        state_array, action_array, source_fps, source_frame_count = load_json_data(
+            ep_path, video_frame_count, target_fps
+        )
+        processed_source_fps.append(source_fps)
+        processed_source_frame_counts.append(source_frame_count)
         num_frames = len(state_array)
         
         # 设置视频帧数（用于伪统计）
@@ -621,6 +830,21 @@ def main(
     # ========================================
     print("\nFinalizing video info...")
     dataset.finalize_video_info()
+
+    if quality_passed_ranges is not None:
+        assert quality_annotation_relative_path is not None
+        write_quality_filter_metadata(
+            output_path,
+            quality_annotation_relative_path,
+            quality_key,
+            target_fps,
+            processed_episode_paths,
+            quality_passed_ranges,
+            processed_video_frame_counts,
+            processed_source_fps,
+            processed_source_frame_counts,
+        )
+        print("Wrote training-time quality filter metadata")
     
     # 清理lerobot创建的空images目录
     img_dir = output_path / "images"

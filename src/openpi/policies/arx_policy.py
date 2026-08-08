@@ -25,7 +25,7 @@ def make_arx_example() -> dict:
 class ArxInputs(transforms.DataTransformFn):
     """Transform inputs for the ARX policy."""
 
-    mode: str = "s2s"  # "s2s", "s2m", "sm2m", "sm2sm", "smp2smp"
+    mode: str = "s2s"  # "s2s", "s2m", "m2m", "sm2m", "sm2sm", "smp2smp"
     action_dim: int = 32
     model_type: _model.ModelType = _model.ModelType.PI0
     state_history_size: int = 0
@@ -40,6 +40,7 @@ class ArxInputs(transforms.DataTransformFn):
     random_pos_offset: float = 0.
     only_right_obs: bool = False
     mask_left_obs: bool = False
+    project_from_sm2sm: bool = False
 
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("left_wrist_view", "face_view", "right_wrist_view")
 
@@ -103,20 +104,20 @@ class ArxInputs(transforms.DataTransformFn):
             pos_offset = (np.random.rand(3) * 2 - 1.) * self.random_pos_offset
             inputs["state"][..., 7:10] += pos_offset
             inputs["actions"][..., 7:10] += pos_offset
-            if self.mode in ["sm2m", "sm2sm", "smp2smp"]:
+            if self.project_from_sm2sm or self.mode in ["sm2m", "sm2sm", "smp2smp"]:
                 inputs["state"][..., 21:24] += pos_offset
-            if self.mode in ["sm2sm", "smp2smp"]:
+            if self.project_from_sm2sm or self.mode in ["sm2sm", "smp2smp"]:
                 inputs["actions"][..., 21:24] += pos_offset
         
         if self.only_right_obs or self.mask_left_obs:
             inputs["image_mask"]["left_wrist_0_rgb"] = np.False_
             if self.slave_state_dim == 14:  # (left + right) x (pos + rot + gripper)
                 inputs["state"][..., :7] = 0.
-                if self.mode in ["sm2m", "sm2sm", "smp2smp"]:
+                if self.project_from_sm2sm or self.mode in ["sm2m", "sm2sm", "smp2smp"]:
                     inputs["state"][..., 14:21] = 0.
                 if "actions" in inputs:
                     inputs["actions"][..., :7] = 0.
-                    if self.mode in ["sm2sm", "smp2smp"]:
+                    if self.project_from_sm2sm or self.mode in ["sm2sm", "smp2smp"]:
                         inputs["actions"][..., 14:21] = 0.
                         
             if self.only_right_obs:
@@ -161,10 +162,105 @@ class ArxInputs(transforms.DataTransformFn):
             
         return state, master_mask
 
+
+@dataclasses.dataclass(frozen=True)
+class ProjectNormalizedSm2sm(transforms.DataTransformFn):
+    """Project normalized full SM2SM state/actions into a policy mode."""
+
+    mode: str
+    action_dim: int = 32
+    state_history_size: int = 0
+    state_future_size: int = 0
+    slave_state_dim: int = 14
+
+    def __call__(self, data: dict) -> dict:
+        state = np.asarray(data["state"])
+        self._validate_dim(state, "state")
+        state_mask = state[..., -1].copy() if state.shape[-1] == self.action_dim else None
+        input_mode, output_mode = self.mode.split("2", maxsplit=1)
+
+        if input_mode == "s":
+            projected_state = state[..., :self.slave_state_dim].copy()
+            if state.ndim == 2 and self.state_future_size > 0:
+                future_start = self.state_history_size + 1
+                projected_state[future_start:] = state[
+                    future_start:,
+                    self.slave_state_dim:self.slave_state_dim * 2,
+                ]
+            state = projected_state
+        elif input_mode == "m":
+            state = state[..., self.slave_state_dim:self.slave_state_dim * 2]
+        elif input_mode not in {"sm", "smp"}:
+            raise ValueError(f"Unsupported ARX input mode: {self.mode}")
+
+        state = transforms.pad_to_dim(state, self.action_dim)
+        if state_mask is not None:
+            state[..., -1] = state_mask
+        data["state"] = state
+
+        if "actions" in data:
+            actions = np.asarray(data["actions"])
+            self._validate_dim(actions, "actions")
+            if output_mode == "s":
+                actions = actions[..., :self.slave_state_dim]
+            elif output_mode == "m":
+                actions = actions[..., self.slave_state_dim:self.slave_state_dim * 2]
+            elif output_mode not in {"sm", "smp"}:
+                raise ValueError(f"Unsupported ARX output mode: {self.mode}")
+            data["actions"] = transforms.pad_to_dim(actions, self.action_dim)
+
+        return data
+
+    def _validate_dim(self, value: np.ndarray, name: str) -> None:
+        required_dim = self.slave_state_dim * 2
+        if value.shape[-1] < required_dim:
+            raise ValueError(
+                f"ARX {self.mode} expects normalized {name} from a full SM2SM dataset with at least "
+                f"{required_dim} dimensions, got {value.shape[-1]}"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class RestoreNormalizedSm2smActions(transforms.DataTransformFn):
+    """Restore projected model actions to full SM2SM slots before unnormalization."""
+
+    mode: str
+    action_dim: int = 32
+    slave_state_dim: int = 14
+
+    def __call__(self, data: dict) -> dict:
+        actions = np.asarray(data["actions"])
+        output_mode = self.mode.split("2", maxsplit=1)[1]
+        if output_mode in {"sm", "smp"}:
+            return data
+
+        restored = np.zeros((*actions.shape[:-1], self.action_dim), dtype=actions.dtype)
+        if output_mode == "s":
+            restored[..., :self.slave_state_dim] = actions[..., :self.slave_state_dim]
+        elif output_mode == "m":
+            restored[..., self.slave_state_dim:self.slave_state_dim * 2] = actions[
+                ..., :self.slave_state_dim
+            ]
+        else:
+            raise ValueError(f"Unsupported ARX output mode: {self.mode}")
+        data["actions"] = restored
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class ArxOutputs(transforms.DataTransformFn):
     """Outputs for the ARX policy."""
+
+    mode: str
     action_dim: int = 14
+    project_from_sm2sm: bool = False
+
     def __call__(self, data: dict) -> dict:
-        actions = np.asarray(data["actions"][:, :self.action_dim])
+        actions = np.asarray(data["actions"])
+        if not self.project_from_sm2sm:
+            return {"actions": actions[:, :self.action_dim]}
+
+        output_mode = self.mode.split("2", maxsplit=1)[1]
+        output_start = self.action_dim if output_mode == "m" else 0
+        actions = actions[:, output_start:output_start + self.action_dim]
         return {"actions": actions}
