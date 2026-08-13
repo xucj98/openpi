@@ -126,6 +126,10 @@ class ArxInputs(transforms.DataTransformFn):
             if self.random_drop_label_global or (inputs["state"][0, 28] != inputs["actions"][10, 28]):  # todo 定义 transition more robustly
                 state[:, 28] = 0
 
+        for k in data:
+            if isinstance(k, str) and k.startswith("_"):
+                inputs[k] = data[k]
+
         return inputs
 
     def _mask_states(self, state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

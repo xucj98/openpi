@@ -855,6 +855,7 @@ class AdaptiveSpeedupDataset:
 
     def __init__(self, dataset, factor_dir, action_horizon, ratio):
         self._dataset = dataset
+        self._log_count = 0
         ratio_str = str(ratio).replace(".", "_")
         dir_name = f"c{action_horizon}_{ratio_str}"
 
@@ -863,13 +864,31 @@ class AdaptiveSpeedupDataset:
             if d.is_dir() and not d.name.startswith(".")
         ])
         self._factors = []
+        num_with_factors = 0
         for ep_dir in ep_dirs:
             fpath = ep_dir / "factor" / dir_name / "adaptive_factor.json"
             if fpath.exists():
                 with open(fpath) as f:
-                    self._factors.append(json.load(f)["factors"])
+                    body = json.load(f)
+                    self._factors.append(body["factors"])
+                    self._factor_fps = body.get("fps", 30.0)
+                num_with_factors += 1
             else:
                 self._factors.append(None)
+
+        self._data_fps = getattr(self._dataset.meta, "fps", 30.0)
+        logging.info(
+            "[AdaptiveSpeedup] factor_dir=%s dir_name=%s episodes_with_factors=%d/%d factor_fps=%.1f data_fps=%.1f",
+            factor_dir, dir_name, num_with_factors, len(self._factors), self._factor_fps, self._data_fps,
+        )
+        for ep_idx in range(min(5, len(self._factors))):
+            factors = self._factors[ep_idx]
+            if factors is not None and ep_idx < len(self._dataset.meta.episodes):
+                ep_len = self._dataset.meta.episodes[ep_idx]["length"]
+                logging.info(
+                    "[AdaptiveSpeedup] ep=%d factor_len=%d ep_len=%d ratio=%.4f",
+                    ep_idx, len(factors), ep_len, len(factors) / ep_len if ep_len > 0 else 0,
+                )
 
     def __len__(self):
         return len(self._dataset)
@@ -883,6 +902,12 @@ class AdaptiveSpeedupDataset:
             sample["_speedup_factor"] = factors[frame]
         else:
             sample["_speedup_factor"] = 1.0
+        self._log_count += 1
+        if self._log_count <= 10 or self._log_count % 5000 == 0:
+            print(
+                f"[AdaptiveSpeedup] sample#{self._log_count} idx={idx} ep={ep} frame={frame} factor={sample['_speedup_factor']:.2f}",
+                flush=True,
+            )
         return sample
 
 

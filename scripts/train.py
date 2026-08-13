@@ -557,6 +557,8 @@ def main(config: _config.TrainConfig):
 
     # 记录数据批次信息（用于调试）
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    actions_label = batch[1]
+    logging.info(f"[DataCheck] actions label shape: {actions_label.shape} (action_horizon={actions_label.shape[1]}, action_dim={actions_label.shape[2]})")
 
     # 创建验证数据加载器（如果启用验证）
     # 使用 shuffle 以获得更好的 IID 采样

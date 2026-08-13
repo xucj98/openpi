@@ -98,7 +98,11 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        result = jax.tree.map(lambda k: flat_item[k], self.structure)
+        for k in data:
+            if isinstance(k, str) and k.startswith("_"):
+                result[k] = data[k]
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
