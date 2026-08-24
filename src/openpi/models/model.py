@@ -63,11 +63,12 @@ IMAGE_RESOLUTION = (224, 224)
 #         "base_0_rgb": bool[*b],  # True if image is valid
 #         ...  # Masks for additional views
 #     },
-#     "state": float32[*b, s],  # Low-dimensional robot state
+#     "state": float32[*b, s] | float32[*b, sh, s],  # Current or historical robot state
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
+#     "action_loss_mask": bool[*b, ah, ad],  # Optional per-action-dimension loss mask
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -76,6 +77,7 @@ IMAGE_RESOLUTION = (224, 224)
 #   *b = batch dimensions
 #   h,w = image height/width
 #   s = state dimension
+#   sh = state sequence length
 #   l = sequence length
 #
 @at.typecheck
@@ -91,8 +93,8 @@ class Observation(Generic[ArrayT]):
     images: dict[str, at.Float[ArrayT, "*b h w c"]]
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
-    # Low-dimensional robot state: (batch, state_dim) or (batch, seq_len, state_dim)
-    state: at.Float[ArrayT, "..."]
+    # Low-dimensional robot state, optionally with a state-sequence axis.
+    state: at.Float[ArrayT, "*b s"] | at.Float[ArrayT, "*b sh s"]
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -105,6 +107,14 @@ class Observation(Generic[ArrayT]):
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+
+    # Structured key-state sidecars stay separate from normalized continuous
+    # robot state/actions. They are explicit infer inputs/outputs; Policy never
+    # owns their recurrent state.
+    key_state_input_ids: at.Int[ArrayT, "*b f"] | None = None
+    key_state_target_ids: at.Int[ArrayT, "*b f"] | None = None
+    key_state_target_mask: at.Bool[ArrayT, "*b f"] | None = None
+    action_loss_mask: at.Bool[ArrayT, "*b ah ad"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -126,6 +136,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            key_state_input_ids=data.get("key_state_input_ids"),
+            key_state_target_ids=data.get("key_state_target_ids"),
+            key_state_target_mask=data.get("key_state_target_mask"),
+            action_loss_mask=data.get("action_loss_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -133,6 +147,9 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        for key in ("key_state_input_ids", "key_state_target_ids", "key_state_target_mask", "action_loss_mask"):
+            if result[key] is None:
+                result.pop(key)
         return result
 
 
@@ -156,7 +173,7 @@ def preprocess_observation(
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
-    batch_shape = observation.state.shape[:1]
+    batch_shape = next(iter(observation.images.values())).shape[:-3]
 
     out_images = {}
     for key in image_keys:
@@ -205,6 +222,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        key_state_input_ids=observation.key_state_input_ids,
+        key_state_target_ids=observation.key_state_target_ids,
+        key_state_target_mask=observation.key_state_target_mask,
+        action_loss_mask=observation.action_loss_mask,
     )
 
 

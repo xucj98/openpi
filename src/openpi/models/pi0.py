@@ -16,6 +16,18 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+class KeyStateTokenParameters(nnx.Module):
+    """Small field-factorized vocabulary used by the opt-in key-state path."""
+
+    def __init__(self, num_fields: int, max_num_values: int, width: int, rngs: nnx.Rngs):
+        init = nnx.initializers.normal(stddev=width**-0.5)
+        self.query_embeddings = nnx.Param(init(rngs.params(), (num_fields, width)))
+        self.field_embeddings = nnx.Param(init(rngs.params(), (num_fields, width)))
+        self.value_embeddings = nnx.Param(init(rngs.params(), (num_fields, max_num_values, width)))
+        self.segment_embeddings = nnx.Param(init(rngs.params(), (2, width)))
+        self.logit_bias = nnx.Param(jnp.zeros((num_fields, max_num_values), dtype=jnp.float32))
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -68,6 +80,11 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.pi05_state_sequence_in_suffix = config.pi05_state_sequence_in_suffix
+        self.key_state_token_mode = config.key_state_token_mode
+        self.key_state_num_values = config.key_state_num_values
+        self.key_state_loss_weight = config.key_state_loss_weight
+        self.key_state_allowed_transitions = config.key_state_allowed_transitions
+        self.key_state_initial_ids = config.key_state_initial_ids
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -101,6 +118,10 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        if self.key_state_token_mode != "disabled":
+            self.key_state_token = KeyStateTokenParameters(
+                len(self.key_state_num_values), max(self.key_state_num_values), paligemma_config.width, rngs
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -134,10 +155,108 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+        if self.key_state_token_mode != "disabled":
+            self._validate_key_state_observation(obs, require_targets=False)
+            previous_state_tokens = self._embed_key_state_values(obs.key_state_input_ids, segment_index=0)
+            tokens.append(previous_state_tokens)
+            input_mask.append(jnp.ones(previous_state_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * previous_state_tokens.shape[1]
+
+            query_tokens = self._embed_key_state_queries(obs.state.shape[0])
+            tokens.append(query_tokens)
+            input_mask.append(jnp.ones(query_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [True] + [False] * (query_tokens.shape[1] - 1)
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
+
+    def _validate_key_state_observation(self, obs: _model.Observation, *, require_targets: bool) -> None:
+        expected_fields = len(self.key_state_num_values)
+        if obs.key_state_input_ids is None:
+            raise ValueError("key-state token mode requires key_state_input_ids")
+        if obs.key_state_input_ids.shape[-1] != expected_fields:
+            raise ValueError(
+                f"expected {expected_fields} key-state input fields, got {obs.key_state_input_ids.shape[-1]}"
+            )
+        if require_targets:
+            if obs.key_state_target_ids is None or obs.key_state_target_mask is None:
+                raise ValueError("training key-state token mode requires target ids and target mask")
+            if obs.key_state_target_ids.shape[-1] != expected_fields:
+                raise ValueError("key_state_target_ids field count does not match schema")
+
+    def _embed_key_state_queries(self, batch_size: int) -> jax.Array:
+        params = self.key_state_token
+        tokens = params.query_embeddings.value + params.field_embeddings.value
+        return jnp.broadcast_to(tokens[None, ...], (batch_size, *tokens.shape))
+
+    def _embed_key_state_values(self, ids: jax.Array, *, segment_index: int) -> jax.Array:
+        ids = jnp.asarray(ids, dtype=jnp.int32)
+        params = self.key_state_token
+        field_indices = jnp.arange(len(self.key_state_num_values))[None, :]
+        values = params.value_embeddings.value[field_indices, ids]
+        return values + params.field_embeddings.value[None, ...] + params.segment_embeddings.value[segment_index]
+
+    def _key_state_logits(self, query_hidden: jax.Array) -> jax.Array:
+        hidden = query_hidden.astype(jnp.float32)
+        hidden = hidden * jax.lax.rsqrt(jnp.mean(jnp.square(hidden), axis=-1, keepdims=True) + 1e-6)
+        logits = jnp.einsum(
+            "bfd,fkd->bfk", hidden, self.key_state_token.value_embeddings.value.astype(jnp.float32)
+        )
+        logits = logits + self.key_state_token.logit_bias.value[None, ...]
+        valid = jnp.arange(logits.shape[-1])[None, :] < jnp.asarray(self.key_state_num_values)[:, None]
+        return jnp.where(valid[None, ...], logits, -jnp.inf)
+
+    def _select_key_state(self, logits: jax.Array, previous_ids: jax.Array) -> jax.Array:
+        schema = tuple(self.key_state_num_values)
+        if not schema:
+            raise ValueError("key-state schema must contain at least one field")
+        previous_ids = jnp.asarray(previous_ids, dtype=jnp.int32)
+        class_ids = jnp.arange(logits.shape[-1])[None, :]
+
+        if self.key_state_allowed_transitions is not None:
+            selected = []
+            for field_index, (_field_size, rows) in enumerate(
+                zip(schema, self.key_state_allowed_transitions, strict=True)
+            ):
+                transition_table = [
+                    [class_id in allowed_values for class_id in range(logits.shape[-1])]
+                    for allowed_values in rows
+                ]
+                legal = jnp.asarray(transition_table, dtype=jnp.bool_)[previous_ids[:, field_index]]
+                selected.append(jnp.argmax(jnp.where(legal, logits[:, field_index], -jnp.inf), axis=-1))
+            return jnp.stack(selected, axis=-1).astype(jnp.int32)
+
+        phase_size = schema[0]
+        previous_phase = previous_ids[:, 0]
+        next_phase = jnp.minimum(previous_phase + 1, phase_size - 1)
+        phase_valid = class_ids < phase_size
+        phase_legal = phase_valid & ((class_ids == previous_phase[:, None]) | (class_ids == next_phase[:, None]))
+        phase = jnp.argmax(jnp.where(phase_legal, logits[:, 0], -jnp.inf), axis=-1)
+        selected = [phase]
+        for field_index, field_size in enumerate(schema[1:], start=1):
+            if schema == (3, 3, 3) and field_index == 2:
+                previous_button = previous_ids[:, field_index]
+                button_legal_p1 = jnp.array(
+                    [[False, True, False], [False, True, True], [False, False, True]], dtype=jnp.bool_
+                )[previous_button]
+                legal = jnp.where(
+                    (phase == 1)[:, None], button_legal_p1, jnp.array([True, False, False])[None, :]
+                )
+            else:
+                previous_value = previous_ids[:, field_index]
+                valid = class_ids < field_size
+                legal = valid & ((previous_value == 0)[:, None] | (class_ids == previous_value[:, None]))
+            selected.append(jnp.argmax(jnp.where(legal, logits[:, field_index], -jnp.inf), axis=-1))
+        return jnp.stack(selected, axis=-1).astype(jnp.int32)
+
+    def _key_state_cross_entropy(self, logits: jax.Array, obs: _model.Observation) -> jax.Array:
+        targets = jnp.asarray(obs.key_state_target_ids, dtype=jnp.int32)
+        mask = jnp.asarray(obs.key_state_target_mask, dtype=jnp.float32)
+        per_field = -jnp.take_along_axis(
+            jax.nn.log_softmax(logits, axis=-1), targets[..., None], axis=-1
+        )[..., 0]
+        return jnp.sum(per_field * mask, axis=-1) / jnp.maximum(jnp.sum(mask, axis=-1), 1.0)
 
     @at.typecheck
     def embed_suffix(
@@ -157,7 +276,7 @@ class Pi0(_model.BaseModel):
             if state.ndim == 2:
                 state = state[:, None, :]
             num_state_tokens = state.shape[1]
-            
+
             state_tokens = self.state_proj(state)
             tokens.append(state_tokens)
             input_mask.append(jnp.ones((state.shape[0], num_state_tokens), dtype=jnp.bool_))
@@ -241,6 +360,9 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        if self.key_state_token_mode != "disabled":
+            actions, _, _ = self.sample_actions_with_key_state(rng, observation, num_steps=num_steps, noise=noise)
+            return actions
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -296,3 +418,84 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    @staticmethod
+    def _resolve_action_condition_state_ids(selected_ids, action_condition_state_ids):
+        if action_condition_state_ids is None:
+            return selected_ids
+        condition_ids = jnp.asarray(action_condition_state_ids, dtype=jnp.int32)
+        if condition_ids.shape != selected_ids.shape:
+            raise ValueError(
+                "action_condition_state_ids must match predicted state shape: "
+                f"expected {selected_ids.shape}, got {condition_ids.shape}"
+            )
+        return condition_ids
+
+    def sample_actions_with_key_state(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_condition_state_ids: at.Int[at.Array, "b f"] | None = None,
+    ) -> tuple[_model.Actions, jax.Array, jax.Array]:
+        """Sample actions and explicitly return the predicted structured state."""
+        if self.key_state_token_mode == "disabled":
+            raise ValueError("sample_actions_with_key_state requires an enabled key-state token mode")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        self._validate_key_state_observation(observation, require_targets=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        num_fields = len(self.key_state_num_values)
+        state_logits = self._key_state_logits(prefix_out[:, -num_fields:])
+        selected_ids = self._select_key_state(state_logits, observation.key_state_input_ids)
+
+        if self.key_state_token_mode == "serial":
+            condition_ids = self._resolve_action_condition_state_ids(selected_ids, action_condition_state_ids)
+            current_tokens = self._embed_key_state_values(condition_ids, segment_index=1)
+            current_mask = jnp.ones(current_tokens.shape[:2], dtype=jnp.bool_)
+            current_ar = jnp.array([True] + [False] * (current_tokens.shape[1] - 1))
+            local_attn = make_attn_mask(current_mask, current_ar)
+            cached_attn = einops.repeat(prefix_mask, "b p -> b s p", s=current_tokens.shape[1])
+            full_attn = jnp.concatenate([cached_attn, local_attn], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(current_mask, axis=-1) - 1
+            _, kv_cache = self.PaliGemma.llm(
+                [current_tokens, None], mask=full_attn, positions=positions, kv_cache=kv_cache
+            )
+            prefix_mask = jnp.concatenate([prefix_mask, current_mask], axis=1)
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            cached_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([cached_attn_mask, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        actions, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return actions, selected_ids, state_logits

@@ -414,6 +414,102 @@ class LeRobotX2robotDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotX2RobotMemoryDataConfig(DataConfigFactory):
+    """X1Pro SM2SM data with delayed state sequences and shared semantic memory."""
+
+    representation: Literal["full_state", "state_token"] = "full_state"
+    state_history_size: int = 3
+    state_future_size: int = 3
+    state_step: int = 1
+    random_drop_master: float = 0.0
+    random_drop_history: float = 0.0
+    random_drop_future: float = 0.0
+    random_pos_offset: float = 0.0
+    robot_state_dim: int = 28
+    memory_dim: int = 3
+
+    @property
+    def state_sequence_length(self) -> int:
+        return self.state_history_size + 1 + self.state_future_size
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return self._create(assets_dirs, model_config, training=False)
+
+    @override
+    def create_for_training(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return self._create(assets_dirs, model_config, training=True)
+
+    def _create(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+        *,
+        training: bool,
+    ) -> DataConfig:
+        if model_config.action_dim != 32:
+            raise ValueError("X1Pro shared-memory layout currently requires model.action_dim=32")
+
+        repack_structure: dict[str, Any] = {
+            "images": {
+                "left_wrist_view": "left_wrist_view",
+                "face_view": "face_view",
+                "right_wrist_view": "right_wrist_view",
+            },
+            "state": "state",
+            "actions": "actions",
+            "prompt": "task",
+            "memory_action_valid": "memory_action_valid",
+        }
+        if self.representation == "state_token":
+            repack_structure.update(
+                {
+                    "key_state_input_ids": "key_state_input_ids",
+                    "key_state_target_ids": "key_state_target_ids",
+                    "key_state_target_mask": "key_state_target_mask",
+                }
+            )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                arx_policy.ArxSm2smInputs(
+                    representation=self.representation,
+                    state_history_size=self.state_history_size,
+                    state_future_size=self.state_future_size,
+                    robot_state_dim=self.robot_state_dim,
+                    memory_dim=self.memory_dim,
+                    random_drop_master=self.random_drop_master if training else 0.0,
+                    random_drop_history=self.random_drop_history if training else 0.0,
+                    random_drop_future=self.random_drop_future if training else 0.0,
+                    random_pos_offset=self.random_pos_offset if training else 0.0,
+                )
+            ],
+            outputs=[
+                arx_policy.ArxSm2smOutputs(
+                    representation=self.representation,
+                    robot_state_dim=self.robot_state_dim,
+                    memory_dim=self.memory_dim,
+                )
+            ],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = _transforms.Group(
+            inputs=[arx_policy.AddStateInpaintingMask(model_config.action_dim), *model_transforms.inputs],
+            outputs=model_transforms.outputs,
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)]),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("actions", "memory_action_valid"),
+            state_history_size=self.state_history_size,
+            state_future_size=self.state_future_size,
+            state_step=self.state_step,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
     # Gripper dimensions will remain in absolute values.
@@ -784,6 +880,64 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_x1pro_drawer_sorting_full_state",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            pi05_state_sequence_in_suffix=True,
+            use_action_loss_mask=True,
+        ),
+        data=LeRobotX2RobotMemoryDataConfig(
+            repo_id="drawer_sorting_x1pro_shared_memory_sm2sm_15hz",
+            assets=AssetsConfig(asset_id="drawer_sorting_x1pro_full_state"),
+            representation="full_state",
+            state_history_size=3,
+            state_future_size=3,
+            random_drop_master=0.10,
+            random_drop_history=0.30,
+            random_pos_offset=0.020,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*state_sequence_proj.*",
+        ),
+        batch_size=32,
+        num_train_steps=30_000,
+        fsdp_devices=1,
+        exp_name="full_state_seed42",
+    ),
+    TrainConfig(
+        name="pi05_x1pro_drawer_sorting_serial_soft",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            pi05_state_sequence_in_suffix=True,
+            key_state_token_mode="serial",
+            key_state_num_values=(4,),
+            key_state_allowed_transitions=(((0, 1, 2, 3), (0, 1), (0, 2), (0, 3)),),
+            key_state_initial_ids=(0,),
+            use_action_loss_mask=True,
+        ),
+        data=LeRobotX2RobotMemoryDataConfig(
+            repo_id="drawer_sorting_x1pro_shared_memory_sm2sm_15hz",
+            assets=AssetsConfig(asset_id="drawer_sorting_x1pro_serial_soft"),
+            representation="state_token",
+            state_history_size=3,
+            state_future_size=3,
+            random_drop_master=0.10,
+            random_drop_history=0.30,
+            random_pos_offset=0.020,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(?:state_sequence_proj|key_state_token).*",
+        ),
+        batch_size=32,
+        num_train_steps=30_000,
+        fsdp_devices=1,
+        exp_name="serial_soft_seed42",
+    ),
     #
     # Inference Aloha configs.
     #

@@ -39,6 +39,13 @@ class Pi0Config(_model.BaseModelConfig):
     # Index of the current state in the state sequence. Auto-set from the data config by TrainConfig.
     state_sequence_current_index: int | None = None
 
+    key_state_token_mode: str = "disabled"
+    key_state_num_values: tuple[int, ...] = (3, 3, 3)
+    key_state_loss_weight: float = 0.1
+    key_state_allowed_transitions: tuple[tuple[tuple[int, ...], ...], ...] | None = None
+    key_state_initial_ids: tuple[int, ...] | None = None
+    use_action_loss_mask: bool = False
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -46,6 +53,35 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if self.pi05_state_sequence_in_suffix and not self.pi05:
             raise ValueError("pi05_state_sequence_in_suffix requires pi05=True")
+        if self.key_state_token_mode not in {"disabled", "parallel", "serial"}:
+            raise ValueError(
+                "key_state_token_mode must be one of disabled, parallel, serial; "
+                f"got {self.key_state_token_mode!r}"
+            )
+        if self.key_state_token_mode != "disabled" and not self.pi05:
+            raise ValueError("key-state tokens are currently supported only for pi05=True")
+        if self.key_state_token_mode != "disabled" and not self.key_state_num_values:
+            raise ValueError("key_state_num_values must contain at least one field")
+        if any(size <= 0 for size in self.key_state_num_values):
+            raise ValueError("all key_state_num_values entries must be positive")
+        if self.key_state_initial_ids is not None:
+            if len(self.key_state_initial_ids) != len(self.key_state_num_values):
+                raise ValueError("key_state_initial_ids must contain one value per field")
+            if any(
+                not 0 <= value < size
+                for value, size in zip(self.key_state_initial_ids, self.key_state_num_values, strict=True)
+            ):
+                raise ValueError("key_state_initial_ids contains an out-of-range category")
+        if self.key_state_allowed_transitions is not None:
+            if len(self.key_state_allowed_transitions) != len(self.key_state_num_values):
+                raise ValueError("key_state_allowed_transitions must contain one transition table per field")
+            for field_size, rows in zip(self.key_state_num_values, self.key_state_allowed_transitions, strict=True):
+                if len(rows) != field_size:
+                    raise ValueError("each key-state transition table needs one row per category")
+                if any(not row for row in rows):
+                    raise ValueError("key-state transition rows must not be empty")
+                if any(value < 0 or value >= field_size for row in rows for value in row):
+                    raise ValueError("key-state transition table contains an out-of-range category")
 
     @property
     @override
@@ -86,6 +122,28 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct(state_shape, jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                key_state_input_ids=(
+                    jax.ShapeDtypeStruct([batch_size, len(self.key_state_num_values)], jnp.int32)
+                    if self.key_state_token_mode != "disabled"
+                    else None
+                ),
+                key_state_target_ids=(
+                    jax.ShapeDtypeStruct([batch_size, len(self.key_state_num_values)], jnp.int32)
+                    if self.key_state_token_mode != "disabled"
+                    else None
+                ),
+                key_state_target_mask=(
+                    jax.ShapeDtypeStruct([batch_size, len(self.key_state_num_values)], jnp.bool_)
+                    if self.key_state_token_mode != "disabled"
+                    else None
+                ),
+                action_loss_mask=(
+                    jax.ShapeDtypeStruct(
+                        [batch_size, self.action_horizon, self.action_dim], jnp.bool_
+                    )
+                    if self.use_action_loss_mask
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

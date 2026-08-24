@@ -10,6 +10,7 @@ from typing import Any
 from etils import epath
 import tyro
 from wandb.sdk.lib.config_util import dict_from_config_file
+import yaml
 
 from openpi.training import config as _config
 
@@ -34,7 +35,17 @@ def load_train_config(checkpoint_dir: epath.Path | str) -> _config.TrainConfig:
         raise FileNotFoundError(
             f"Checkpoint config not found at {path}. Backfill metadata for legacy checkpoints first."
         )
-    return tyro.extras.from_yaml(_config.TrainConfig, path.read_text())
+    text = path.read_text()
+    # Newer standalone checkpoints use tyro's tagged YAML. RMBench stores a
+    # portable safe-YAML snapshot, so restore it over the registered config
+    # template to recover the concrete model/data dataclass types.
+    if text.lstrip().startswith("!"):
+        return tyro.extras.from_yaml(_config.TrainConfig, text)
+    payload = yaml.safe_load(text)
+    if not isinstance(payload, dict) or not payload.get("name"):
+        raise ValueError(f"Invalid checkpoint config at {path}")
+    template = _config.get_config(str(payload["name"]))
+    return _restore_dataclass(template, payload)
 
 
 def load_datasets(checkpoint_dir: epath.Path | str) -> dict[str, Any]:
@@ -132,7 +143,7 @@ def _restore_value(current: Any, value: Any) -> tuple[Any, bool]:
     if isinstance(current, enum.Enum):
         return type(current)(value), True
     if current is None:
-        return value, value is None or isinstance(value, str | int | float | bool)
+        return value, value is None or isinstance(value, str | int | float | bool | dict | list)
     if isinstance(current, bool) and isinstance(value, bool):
         return value, True
     if isinstance(current, str) and isinstance(value, str):
